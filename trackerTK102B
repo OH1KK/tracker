@@ -7,6 +7,8 @@
 #
 # Developped by : Cyril Feraudet
 #
+# 2017-03-12 Modified for TK-102B by Kari Karvonen <oh1kk at toimii.fi>
+#
 ###################################################################
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -22,29 +24,23 @@
 ####################################################################
 /**
   * Database creation script
-  * CREATE DATABASE `tracker` DEFAULT CHARACTER SET latin1 COLLATE latin1_swedish_ci;
+  * CREATE DATABASE `tracker` DEFAULT CHARACTER SET utf8
   * USE `tracker`;
-  * CREATE TABLE IF NOT EXISTS `gprmc` (
+  * CREATE TABLE IF NOT EXISTS `tracker` (
   *   `id` int(11) NOT NULL AUTO_INCREMENT,
-  *   `date` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  *   `imei` varchar(17) NOT NULL,
-  *   `phone` varchar(20) DEFAULT NULL,
-  *   `trackerdate` varchar(10) NOT NULL,
-  *   `satelliteDerivedTime` varchar(10) NOT NULL,
+  *   `imei` varchar(12) NOT NULL,
+  *   `timestamp` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   *   `satelliteFixStatus` char(1) NOT NULL,
-  *   `latitudeDecimalDegrees` varchar(12) NOT NULL,
-  *   `latitudeHemisphere` char(1) NOT NULL,
-  *   `longitudeDecimalDegrees` varchar(12) NOT NULL,
-  *   `longitudeHemisphere` char(1) NOT NULL,
+  *   `latitude` DECIMAL(10, 8) NOT NULL,
+  *   `longitude` DECIMAL(11, 8) NOT NULL,
   *   `speed` float NOT NULL,
-  *   `bearing` float NOT NULL,
-  *   `utcDate` varchar(6) NOT NULL,
-  *   `checksum` varchar(10) NOT NULL,
-  *   `gpsSignalIndicator` char(1) NOT NULL,
-  *   `other` varchar(50) DEFAULT NULL,
+  *   `orientation` varchar(6) NOT NULL,
+  *   `iostate` varchar(8) NOT NULL,
+  *   `miledata` varchar(8) NOT NULL,
+  *   `rawstring` varchar(82) DEFAULT NULL,
   *   PRIMARY KEY (`id`),
   *   KEY `imei` (`imei`)
-  * ) ENGINE=MyISAM  DEFAULT CHARSET=latin1;
+  * ) ENGINE=MyISAM  DEFAULT CHARSET=utf8;
   */
 
 /**
@@ -52,7 +48,7 @@
   */
 
 $ip = '0.0.0.0';
-$port = 1025;
+$port = 65432;
 
 $__server_listening = true;
 
@@ -60,9 +56,12 @@ error_reporting(E_ALL);
 set_time_limit(0);
 ob_implicit_flush();
 declare(ticks = 1);
+$debug = false;
 
 if(!isset($argv[1]) || $argv[1] != '-f') {
 	become_daemon();
+} else {
+	$debug = true;
 }
 
 /* nobody/nogroup, change to your host's uid/gid of the non-priv user */
@@ -84,6 +83,7 @@ function change_identity( $uid, $gid )
     if( !posix_setgid( $gid ) )
     {
         print "Unable to setgid to " . $gid . "!\n";
+	print "Hint: try running as root\n";
         exit;
     }
 
@@ -107,6 +107,11 @@ function server_loop($address, $port)
     {
         echo "failed to create socket: ".socket_strerror($sock)."\n";
         exit();
+    }
+
+    if (!socket_set_option($sock, SOL_SOCKET, SO_REUSEADDR, 1)) 
+    {
+         echo "Unable to set option on socket: ". socket_strerror(socket_last_error()) . PHP_EOL;
     }
 
     if(($ret = socket_bind($sock, $address, $port)) < 0)
@@ -151,6 +156,7 @@ function sig_handler($sig)
     {
         case SIGTERM:
         case SIGINT:
+
             exit();
         break;
 
@@ -189,71 +195,62 @@ function handle_client($ssock, $csock)
 
 function interact($socket)
 {
+	global $debug;
     	/* TALK TO YOUR CLIENT */
 	$rec = "";
+	$unknown_message = true;
+	$client_address="";
+	$client_port="";
 	socket_recv($socket, $rec, 2048, 0);
-	$parts = split(',',$rec);
-	$cnx = mysql_connect('localhost', 'tracker', '');
-	/*
-	Array
-	(
-	    [0] => 0908242216
-	    [1] => 0033663282263
-	    [2] => GPRMC
-	    [3] => 212442.000
-	    [4] => A
-	    [5] => 4849.0475
-	    [6] => N
-	    [7] => 00219.4763
-	    [8] => E
-	    [9] => 2.29
-	    [10] =>
-	    [11] => 220809
-	    [12] =>
-	    [13] =>
-	    [14] => A*70
-	    [15] => L
-	    [16] => imei:359587017313647
-	    [17] => 101Q
-	    [18] =>
+	socket_getpeername($socket, $client_address, $client_port);
+	debug_print("Connection from $client_address:$client_port");
 
-	)
-	*/
+	$regex1="/";
+	$regex1.="(?<IMEI>.{12})";
+	$regex1.="(?<CMD>.{4})";
+	$regex1.="(?<GPSDATE>\d{6})";
+	$regex1.="(?<VALID>[VA])";
+	$regex1.="(?<LATITUDE1>\d{2})(?<LATITUDE2>\d{2}\.\d{4})(?<LATITUDE3>N|S)";
+	$regex1.="(?<LONGITUDE1>\d{3})(?<LONGITUDE2>\d{2}\.\d{4})(?<LONGITUDE3>E|W)";
+	$regex1.="(?<SPEED>\d{3}\.\d{1})";
+	$regex1.="(?<GPSTIME>\d{6})";
+	$regex1.="(?<ORIENTATION>.{6}),";
+	$regex1.="(?<IOSTATE>\d{8})";
+	$regex1.="L";
+        $regex1.="(?<MILEDATA>\d{8})";
+	$regex1.="/";
 
-
-	$trackerdate 			= mysql_real_escape_string($parts[0]);
-	$phone 				= mysql_real_escape_string($parts[1]);
-	$gprmc 				= mysql_real_escape_string($parts[2]);
-	$satelliteDerivedTime 		= mysql_real_escape_string($parts[3]);
-	$satelliteFixStatus 		= mysql_real_escape_string($parts[4]);
-	$latitudeDecimalDegrees 	= mysql_real_escape_string($parts[5]);
-	$latitudeHemisphere 		= mysql_real_escape_string($parts[6]);
-	$longitudeDecimalDegrees 	= mysql_real_escape_string($parts[7]);
-	$longitudeHemisphere 		= mysql_real_escape_string($parts[8]);
-	$speed 				= mysql_real_escape_string($parts[9]);
-	$bearing 			= mysql_real_escape_string($parts[10]);
-	$utcDate 			= mysql_real_escape_string($parts[11]);
-	// = $parts[12];
-	// = $parts[13];
-	$checksum 			= mysql_real_escape_string($parts[14]);
-	$gpsSignalIndicator 		= mysql_real_escape_string($parts[15]);
-	if(ereg("imei",$parts[16]))
-	{
-		$imei 				= mysql_real_escape_string($parts[16]);
-		$other 				= mysql_real_escape_string($parts[17].' '.$parts[18]);
+	if (preg_match($regex1, $rec, $out)) {
+		debug_print("Received coordinates: ".$out["0"]);
+	        $lat = $out["LATITUDE1"]+$out["LATITUDE2"]/60;
+	        $lon = $out["LONGITUDE1"]+$out["LONGITUDE2"]/60;
+	        if ($out["LATITUDE3"] == "S") $lat=-1*$lat;
+	        if ($out["LONGITUDE3"] == "W") $lon=-1*$lon;
+	        date_default_timezone_set("UTC");
+	        $timestamp = strtotime("20".$out["GPSDATE"]." ".$out["GPSTIME"]);
+		$dbconn = mysqli_connect('localhost', 'tracker', 'tracker','tracker');
+		$query = "INSERT INTO tracker (imei, timestamp, satelliteFixStatus, latitude, longitude, speed, orientation, iostate, miledata, rawstring) VALUES (?,from_unixtime(?),?,?,?,?,?,?,?,?)";
+		if ($stmt = mysqli_prepare ($dbconn , $query)) {
+			mysqli_stmt_bind_param($stmt,"sisdddssss", $out["IMEI"], $timestamp, $out["VALID"], $lat, $lon, $out["SPEED"], $out["ORIENTATION"], $out["IOSTATE"], $out["MILEDATA"], $rec);
+			mysqli_stmt_execute($stmt);
+			if (mysqli_stmt_errno($stmt) <> 0) printf("Error: %d. %s\n", mysqli_stmt_errno($stmt), mysqli_stmt_error($stmt));
+			mysqli_stmt_close($stmt);
+		}
+		mysqli_close($dbconn);
+		$unknown_message=false;
 	}
-	else
-	{
-		$imei 				= mysql_real_escape_string($parts[17]);
-		$other 				= mysql_real_escape_string($parts[18].' '.$parts[19]);
-	}
-	
-	$imei = substr($imei,5);
+	if (preg_match("/(?<IMEI>.{12})BP00HSO/",$rec,$out)) {
+		// Handshake. No coodrinates.
+		debug_print("Received Up message: ".$out["0"]);
+		//$answer="(".$out["IMEI"]."AP01HSO)";
+		//debug_print("Sending handshake answer: ".$answer);
+		//socket_send($socket,$answer,strlen($answer),MSG_EOR);
+		$unknown_message = false;
 
-	mysql_select_db('tracker', $cnx);
-	if($gpsSignalIndicator != 'L')
-		mysql_query("INSERT INTO gprmc (date, imei, phone, trackerdate, satelliteDerivedTime, satelliteFixStatus, latitudeDecimalDegrees, latitudeHemisphere, longitudeDecimalDegrees, longitudeHemisphere, speed, Bearing, utcDate, Checksum, gpsSignalIndicator, other) VALUES (now(), '$imei', '$phone', '$trackerdate', '$satelliteDerivedTime', '$satelliteFixStatus', '$latitudeDecimalDegrees', '$latitudeHemisphere', '$longitudeDecimalDegrees', '$longitudeHemisphere', '$speed', '$bearing', '$utcDate', '$checksum', '$gpsSignalIndicator', '$other')", $cnx);
-	mysql_close($cnx);
+	}
+	if ($unknown_message) {
+		debug_print("Received unknown message: $rec");
+	}
 }
 
 /**
@@ -282,5 +279,11 @@ function become_daemon()
 
     }
 } 
+
+function debug_print($msg) {
+	global $debug;
+	if ($debug) echo date("d.m.Y H:i:s")." $msg\n";
+}
+
 
 ?>
